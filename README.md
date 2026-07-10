@@ -1,4 +1,4 @@
-# GOAL: Gradient Orthogonalization with Contrastive Learning
+# Revisiting Over-refusal in Safety-oriented Large Language Models: A Latent Knowledge Perspective
 
 ## Overview
 
