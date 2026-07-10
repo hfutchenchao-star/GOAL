@@ -142,18 +142,18 @@ MODEL_CONFIGS = {
     },                                                                                                                                                     
       "gemma": {
           "model_name": "google/gemma-7b-it",
-          "middle_layer_start": 14,   # ← 你定，Gemma-7b 28 层
-          "middle_layer_end": 23,     # ← 你定，exclusive
+          "middle_layer_start": 14,   
+          "middle_layer_end": 23,     
     },
     "llama2_13b": {
         "model_name": "meta-llama/Llama-2-13b-chat-hf",
-        "middle_layer_start": 12,   # Llama-2-13b 40 层，按 7B 的 11/32 比例放大
-        "middle_layer_end": 26,     # exclusive
+        "middle_layer_start": 12,   
+        "middle_layer_end": 26,     
     },
     "llama3_1b": {
         "model_name": "meta-llama/Llama-3.2-1B-Instruct",
-        "middle_layer_start": 7,    # Llama-3.2-1B 16 层
-        "middle_layer_end": 13,     # exclusive
+        "middle_layer_start": 7,    
+        "middle_layer_end": 13,     
     },
 }
 
