@@ -72,6 +72,11 @@ class Config:
     circle_bank_size: int = 128        # class-balanced representation bank size
     # -1 means the final hidden-state layer returned by the model.
     circle_target_layer: int = -1
+    # Rebuttal control: also remove the refusal-subspace component from the
+    # contrastive gradient, i.e. use (I-P) g_cont instead of g_cont.
+    project_contrastive_gradient: bool = os.environ.get(
+        "GOAL_PROJECT_CONTRASTIVE_GRADIENT", "0"
+    ).lower() in {"1", "true", "yes"}
 
     # ---- training ----
     output_dir: str = ""  # auto-generated in __post_init__
@@ -110,6 +115,8 @@ class Config:
                     circle += "-pushonly" if self.circle_push_only else "-full"
                     layer_tag = "final" if self.circle_target_layer == -1 else self.circle_target_layer
                     circle += f"-tl{layer_tag}-g{self.circle_gamma}"
+                    if self.project_contrastive_gradient:
+                        circle += "-projected-gradient"
                 layers = f"L{self.middle_layer_start}-{self.middle_layer_end}"
                 tune = "lora" if self.use_lora else "full"
                 if self.apply_lora_globally:

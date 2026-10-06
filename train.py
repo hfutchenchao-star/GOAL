@@ -7,7 +7,8 @@ Two-phase per-step design:
             over-refusal gradients have their top-k SVD refusal-subspace
             component removed.
 
-Final gradient = (1/B) Σ project(g_sft_i) + λ · g_circle
+Default gradient = (1/B) Σ project(g_sft_i) + λ · g_circle
+Control experiment = (1/B) Σ project(g_sft_i) + project(λ · g_circle)
 """
 import math
 import os
@@ -54,6 +55,15 @@ def project_out(g: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
     """
     coeffs = basis @ g
     return g - basis.t() @ coeffs
+
+
+def subspace_energy_ratio(g: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    """Return ||P g||_2^2 / ||g||_2^2 for an orthonormal row basis."""
+    denominator = g.square().sum()
+    if denominator <= 0:
+        return torch.zeros((), device=g.device, dtype=g.dtype)
+    coeffs = basis @ g
+    return coeffs.square().sum() / denominator
 
 
 def last_token_pool(hidden_states: torch.Tensor,
@@ -204,6 +214,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(cfg.output_dir, exist_ok=True)
 
+    if cfg.project_contrastive_gradient and not cfg.use_orthogonal_projection:
+        raise ValueError(
+            "project_contrastive_gradient requires use_orthogonal_projection=True"
+        )
+
     # ---- model ----
     tok = load_tokenizer()
     model, params = build_trainable_model()
@@ -227,6 +242,8 @@ def main():
         )
         print(f"[train] loaded refusal basis: {tuple(basis.shape)} "
               f"(mode={prior.get('mode', '?')})")
+        if cfg.project_contrastive_gradient:
+            print("[train] contrastive-gradient projection ENABLED")
     else:
         print("[train] orthogonal projection DISABLED (baseline SFT mode)")
 
@@ -287,6 +304,8 @@ def main():
     grad_accum = torch.zeros(expected_D, device=device, dtype=torch.float32)
     accum_sft_loss = 0.0
     accum_cl_loss = 0.0
+    accum_cl_subspace_ratio = 0.0
+    accum_cl_subspace_count = 0
     accum_projected = 0
     accum_samples = 0
 
@@ -302,6 +321,7 @@ def main():
             contrastive_g = torch.zeros(expected_D, device=device,
                                         dtype=torch.float32)
             cl_loss_val = 0.0
+            cl_subspace_ratio = None
 
             if cfg.circle_loss_weight > 0:
                 for p in params:
@@ -327,6 +347,12 @@ def main():
                     (cfg.circle_loss_weight * cl_loss).backward()
                     contrastive_g = flatten_grads(params).to(device)
                     cl_loss_val = cl_loss.item()
+                    if basis is not None:
+                        cl_subspace_ratio = subspace_energy_ratio(
+                            contrastive_g, basis
+                        ).item()
+                    if cfg.project_contrastive_gradient:
+                        contrastive_g = project_out(contrastive_g, basis)
 
                 # Update bank with detached representations
                 rep_bank.push(reps.detach(), batch["label_ids"])
@@ -363,13 +389,17 @@ def main():
 
             step_accum.div_(B)
 
-            # Combine: projected SFT gradient + contrastive gradient
+            # Combine projected SFT gradients with either the original or
+            # refusal-orthogonal contrastive gradient.
             step_accum.add_(contrastive_g)
 
             # Accumulate into running gradient buffer
             grad_accum.add_(step_accum)
             accum_sft_loss += total_loss / max(1, B)
             accum_cl_loss += cl_loss_val
+            if cl_subspace_ratio is not None:
+                accum_cl_subspace_ratio += cl_subspace_ratio
+                accum_cl_subspace_count += 1
             accum_projected += n_projected
             accum_samples += B
             micro_step += 1
@@ -387,11 +417,16 @@ def main():
 
                 avg_loss = accum_sft_loss / cfg.gradient_accumulation_steps
                 avg_cl = accum_cl_loss / cfg.gradient_accumulation_steps
+                avg_cl_ratio = (
+                    accum_cl_subspace_ratio / accum_cl_subspace_count
+                    if accum_cl_subspace_count > 0 else 0.0
+                )
                 cur_lr = optim.param_groups[0]["lr"]
 
                 pbar.update(1)
                 pbar.set_postfix(epoch=epoch, sft=f"{avg_loss:.4f}",
                                  cl=f"{avg_cl:.4f}",
+                                 cl_sub=f"{100 * avg_cl_ratio:.2f}%",
                                  lr=f"{cur_lr:.2e}",
                                  proj=f"{accum_projected}/{accum_samples}")
 
@@ -399,6 +434,7 @@ def main():
                     wandb.log({
                         "train/sft_loss":    avg_loss,
                         "train/circle_loss": avg_cl,
+                        "train/contrastive_subspace_energy_ratio": avg_cl_ratio,
                         "train/lr":          cur_lr,
                         "train/epoch":       epoch,
                         "train/n_projected_in_batch": accum_projected,
@@ -411,6 +447,8 @@ def main():
                 grad_accum.zero_()
                 accum_sft_loss = 0.0
                 accum_cl_loss = 0.0
+                accum_cl_subspace_ratio = 0.0
+                accum_cl_subspace_count = 0
                 accum_projected = 0
                 accum_samples = 0
 

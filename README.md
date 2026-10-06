@@ -63,6 +63,21 @@ Then train GOAL:
 python train.py
 ```
 
+### Projecting the contrastive gradient
+
+For the rebuttal control experiment that also projects the contrastive
+gradient as $(I-P)g_{\mathrm{cont}}$, run:
+
+```bash
+GOAL_PROJECT_CONTRASTIVE_GRADIENT=1 python train.py
+```
+
+The default value is `0`, which preserves the original GOAL update. When the
+option is enabled, checkpoints are written to a separate directory whose name
+contains `projected-gradient`. Training also logs
+`contrastive_subspace_energy_ratio`, defined as
+$\lVert Pg_{\mathrm{cont}}\rVert_2^2 / \lVert g_{\mathrm{cont}}\rVert_2^2$.
+
 By default, checkpoints and the refusal basis are saved under `checkpoints/`. To use a custom refusal-basis path:
 
 ```bash
