@@ -9,5 +9,6 @@ env/
 checkpoints/
 datasets/
 eval_results*.json
+attack_results/
 
 .DS_Store

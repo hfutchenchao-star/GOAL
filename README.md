@@ -75,3 +75,9 @@ For evaluation:
 export OPENAI_API_KEY=your_api_key
 python eval.py --ckpt /path/to/checkpoint
 ```
+
+## Optimization-based jailbreak evaluation
+
+The GCG and TAO-Attack scripts used for the rebuttal, together with the
+HarmBench evaluation script, are provided in
+[`experiments/jailbreak`](experiments/jailbreak).
