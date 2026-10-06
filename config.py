@@ -28,6 +28,11 @@ class Config:
     # Set both for the global-LoRA SFT baseline experiment.
     apply_lora_globally: bool = False
     use_orthogonal_projection: bool = True
+    # Rebuttal control: recompute the refusal subspace from the current model
+    # once at the beginning of every training epoch.
+    recompute_refusal_subspace_each_epoch: bool = os.environ.get(
+        "GOAL_RECOMPUTE_SUBSPACE_EACH_EPOCH", "0"
+    ).lower() in {"1", "true", "yes"}
 
     # ---- data ----
     dataset_dir: str = os.environ.get(
@@ -123,6 +128,8 @@ class Config:
                     tune = "lora-global"
                 if not self.use_orthogonal_projection:
                     proj = "noproj"
+                elif self.recompute_refusal_subspace_each_epoch:
+                    proj += "-periodic"
                 self.output_dir = os.path.join(
                     PROJECT_DIR,
                     "checkpoints",

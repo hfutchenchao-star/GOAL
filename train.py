@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from config import cfg
-from data import SFTDataset, collate, load_labeled_examples
+from data import SFTDataset, collate, load_harmful_only, load_labeled_examples
 from model_utils import (
     assign_flat_to_grads,
     build_trainable_model,
@@ -64,6 +64,84 @@ def subspace_energy_ratio(g: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
         return torch.zeros((), device=g.device, dtype=g.dtype)
     coeffs = basis @ g
     return coeffs.square().sum() / denominator
+
+
+def subspace_overlap(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    """Mean squared cosine of the principal angles between two row spaces."""
+    rank = min(first.shape[0], second.shape[0])
+    return (first.float() @ second.float().t()).square().sum() / max(1, rank)
+
+
+def recompute_refusal_basis(model, params, tokenizer, device, epoch: int):
+    """Compute a refusal basis from the current model at an epoch boundary."""
+    examples = load_harmful_only()[: cfg.prior_max_samples]
+    if not examples:
+        raise RuntimeError("No harmful examples available for subspace extraction")
+    dataset = SFTDataset(examples, tokenizer, cfg.max_seq_len)
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.prior_batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate(batch, tokenizer.pad_token_id),
+    )
+    expected_dim = sum(parameter.numel() for parameter in params)
+    gradients = []
+    mean_gradient = torch.zeros(expected_dim, dtype=torch.float32)
+    count = 0
+    progress = tqdm(
+        loader,
+        desc=f"subspace epoch {epoch + 1}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+
+    for batch in progress:
+        batch = {key: value.to(device) for key, value in batch.items()}
+        for parameter in params:
+            if parameter.grad is not None:
+                parameter.grad.zero_()
+        output = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+        )
+        output.loss.backward()
+        gradient = flatten_grads(params).cpu().float()
+        if cfg.use_mean_only:
+            mean_gradient.mul_(count / (count + 1)).add_(
+                gradient, alpha=1.0 / (count + 1)
+            )
+        else:
+            gradients.append(gradient)
+        count += 1
+        progress.set_postfix(loss=f"{output.loss.item():.3f}")
+
+    for parameter in params:
+        if parameter.grad is not None:
+            parameter.grad.zero_()
+
+    if cfg.use_mean_only:
+        norm = mean_gradient.norm()
+        if norm.item() == 0.0:
+            raise RuntimeError("Mean harmful gradient has zero norm")
+        basis = (mean_gradient / norm).unsqueeze(0)
+    else:
+        gradient_matrix = torch.stack(gradients, dim=0)
+        _, singular_values, right_vectors = torch.linalg.svd(
+            gradient_matrix, full_matrices=False
+        )
+        rank = min(cfg.refusal_subspace_k, right_vectors.shape[0])
+        basis = right_vectors[:rank]
+        print(
+            f"[train] epoch {epoch + 1} top-{rank} singular values: "
+            f"{singular_values[:rank].tolist()}"
+        )
+
+    print(
+        f"[train] recomputed refusal basis for epoch {epoch + 1}: "
+        f"{tuple(basis.shape)} from {len(examples)} harmful examples"
+    )
+    return basis.half()
 
 
 def last_token_pool(hidden_states: torch.Tensor,
@@ -214,9 +292,12 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    if cfg.project_contrastive_gradient and not cfg.use_orthogonal_projection:
+    if ((cfg.project_contrastive_gradient
+         or cfg.recompute_refusal_subspace_each_epoch)
+            and not cfg.use_orthogonal_projection):
         raise ValueError(
-            "project_contrastive_gradient requires use_orthogonal_projection=True"
+            "Contrastive-gradient projection and periodic subspace "
+            "recomputation require use_orthogonal_projection=True"
         )
 
     # ---- model ----
@@ -229,19 +310,22 @@ def main():
     expected_D = sum(p.numel() for p in params)
     basis = None
     if cfg.use_orthogonal_projection:
-        if not os.path.exists(cfg.prior_save_path):
-            raise FileNotFoundError(
-                f"Refusal basis not found at {cfg.prior_save_path}. "
-                f"Run `python gradient_prior.py` first."
+        if cfg.recompute_refusal_subspace_each_epoch:
+            print("[train] per-epoch refusal-subspace recomputation ENABLED")
+        else:
+            if not os.path.exists(cfg.prior_save_path):
+                raise FileNotFoundError(
+                    f"Refusal basis not found at {cfg.prior_save_path}. "
+                    f"Run `python gradient_prior.py` first."
+                )
+            prior = torch.load(cfg.prior_save_path, map_location="cpu")
+            basis = prior["basis"].to(device=device, dtype=torch.float32)
+            assert basis.shape[1] == expected_D, (
+                f"basis dim {basis.shape[1]} != trainable param dim {expected_D}. "
+                f"Did the trainable parameter set change between prior and training?"
             )
-        prior = torch.load(cfg.prior_save_path, map_location="cpu")
-        basis = prior["basis"].to(device=device, dtype=torch.float32)  # (k, D)
-        assert basis.shape[1] == expected_D, (
-            f"basis dim {basis.shape[1]} != trainable param dim {expected_D}. "
-            f"Did the trainable parameter set change between prior and training?"
-        )
-        print(f"[train] loaded refusal basis: {tuple(basis.shape)} "
-              f"(mode={prior.get('mode', '?')})")
+            print(f"[train] loaded refusal basis: {tuple(basis.shape)} "
+                  f"(mode={prior.get('mode', '?')})")
         if cfg.project_contrastive_gradient:
             print("[train] contrastive-gradient projection ENABLED")
     else:
@@ -308,9 +392,32 @@ def main():
     accum_cl_subspace_count = 0
     accum_projected = 0
     accum_samples = 0
+    previous_epoch_basis = None
 
     pbar = tqdm(total=total_steps, desc="train", dynamic_ncols=True)
     for epoch in range(cfg.epochs):
+        if cfg.recompute_refusal_subspace_each_epoch:
+            basis_cpu = recompute_refusal_basis(
+                model, params, tok, device, epoch
+            )
+            assert basis_cpu.shape[1] == expected_D, (
+                f"basis dim {basis_cpu.shape[1]} != trainable param dim {expected_D}"
+            )
+            overlap = None
+            if previous_epoch_basis is not None:
+                overlap = subspace_overlap(previous_epoch_basis, basis_cpu).item()
+                print(
+                    f"[train] epoch {epoch + 1} subspace overlap with previous "
+                    f"epoch: {100 * overlap:.2f}%"
+                )
+            previous_epoch_basis = basis_cpu
+            basis = basis_cpu.to(device=device, dtype=torch.float32)
+            if use_wandb and overlap is not None:
+                wandb.log(
+                    {"train/subspace_overlap_previous_epoch": overlap},
+                    step=global_step,
+                )
+
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             B = batch["input_ids"].size(0)
