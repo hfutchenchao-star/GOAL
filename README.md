@@ -65,9 +65,6 @@ python train.py
 
 ### Projecting the contrastive gradient
 
-For the rebuttal control experiment that also projects the contrastive
-gradient as $(I-P)g_{\mathrm{cont}}$, run:
-
 ```bash
 GOAL_PROJECT_CONTRASTIVE_GRADIENT=1 python train.py
 ```
