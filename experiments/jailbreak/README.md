@@ -64,6 +64,3 @@ python experiments/jailbreak/judge_harmbench.py \
   attack_results/tao_goal.json \
   --output-dir attack_results/harmbench_judged
 ```
-
-The reported attack success rate is 0% for both Base and GOAL under both GCG
-and TAO-Attack.
